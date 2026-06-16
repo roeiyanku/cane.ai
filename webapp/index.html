@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>cane.ai — on-device</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; color: #eee;
+               font-family: system-ui, sans-serif; overscroll-behavior: none; }
+  #stage { position: fixed; inset: 0; display: grid; place-items: center; }
+  #view { max-width: 100vw; max-height: 100vh; display: block; }
+  #hud { position: fixed; left: 8px; bottom: 8px; font-size: 12px;
+         background: rgba(0,0,0,.5); padding: 4px 8px; border-radius: 6px; }
+  #panel { position: fixed; inset: 0; display: grid; place-items: center;
+           background: rgba(0,0,0,.85); text-align: center; padding: 24px; }
+  #panel.hidden { display: none; }
+  #panel .card { max-width: 360px; }
+  button { font-size: 18px; padding: 14px 22px; border: 0; border-radius: 10px;
+           background: #3ec860; color: #022; font-weight: 700; }
+  #status { margin-top: 14px; font-size: 13px; color: #bbb; min-height: 1.2em; }
+  .vid-hidden { position: absolute; width: 1px; height: 1px; opacity: 0;
+                pointer-events: none; }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="view"></canvas>
+  </div>
+  <div id="hud">—</div>
+
+  <video id="cam" class="vid-hidden" playsinline muted autoplay></video>
+
+  <div id="errlog" style="position:fixed;left:0;right:0;top:0;max-height:40vh;
+       overflow:auto;background:rgba(120,0,0,.85);color:#fff;font:12px/1.4 monospace;
+       padding:8px;white-space:pre-wrap;display:none;z-index:10;"></div>
+
+  <script>
+    // Surfaces errors that happen even before/while the module loads, so the
+    // page never just "does nothing" silently.
+    (function () {
+      const box = document.getElementById("errlog");
+      function show(msg) {
+        box.style.display = "block";
+        box.textContent += msg + "\n";
+      }
+      window.addEventListener("error", (e) =>
+        show("ERROR: " + (e.message || e.error) +
+             (e.filename ? "\n  at " + e.filename + ":" + e.lineno : "")));
+      window.addEventListener("unhandledrejection", (e) =>
+        show("PROMISE REJECTED: " + (e.reason && (e.reason.stack || e.reason.message || e.reason))));
+    })();
+  </script>
+
+  <div id="panel">
+    <div class="card">
+      <h2>cane.ai</h2>
+      <p>Runs sidewalk segmentation + depth on your phone, live from the camera.
+         First start downloads the models (~200&nbsp;MB) once.</p>
+      <button id="start">Start camera</button>
+      <div id="status"></div>
+    </div>
+  </div>
+
+<script type="module">
+// ---------------------------------------------------------------------------
+// cane.ai — fully on-device perception in the browser.
+//
+// Mirrors server/perception.py (segmentation + depth + fusion) and
+// live_view.py (overlay), but runs the models on the phone via transformers.js
+// + WebGPU. No server, no PC. See README for hosting (needs HTTPS for camera).
+// ---------------------------------------------------------------------------
+import {
+  pipeline, RawImage, env
+} from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0/dist/transformers.min.js";
+
+// Cache model weights in the browser; allow remote download from the Hub.
+env.allowLocalModels = false;
+
+// ---- models (swap here if you want a heavier/lighter checkpoint) ----------
+// b0 is the light ADE SegFormer; bump to b2 for quality at a big speed cost.
+const SEG_MODEL   = "Xenova/segformer-b0-finetuned-ade-512-512";
+const DEPTH_MODEL = "onnx-community/depth-anything-v2-small";
+
+// Working resolution for fusion. Small = fast; the camera is downscaled to
+// this before inference and the overlay is scaled back up for display.
+const WORK_W = 256;
+
+// Fusion constants — kept identical to perception.py.
+const GROUND_MARGIN_REL = 0.12;
+const MIN_GROUND_PX = 8;
+
+// Overlay colors. live_view.py uses BGR; here we use plain RGB.
+const GREEN  = [60, 200, 60];    // sidewalk
+const CYAN   = [50, 190, 220];   // road / terrain
+const ORANGE = [255, 140, 0];    // direction arrow
+const RED     = [230, 60, 60];   // obstacle
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status");
+const hud = $("hud");
+const setStatus = (t) => { statusEl.textContent = t; };
+
+// Category lookup for ADE labels (matches the name-matching in perception.py).
+function categorize(label) {
+  const n = label.toLowerCase();
+  if (n.includes("sidewalk") || n.includes("pavement")) return "walkable";
+  if (n.includes("road")) return "road";
+  for (const w of ["grass","earth","ground","terrain","field","sand","dirt","soil"])
+    if (n.includes(w)) return "terrain";
+  return null;
+}
+
+let segPipe = null, depthPipe = null;
+
+let activeDevice = "wasm";
+
+async function loadModels() {
+  const tryDevice = async (device) => {
+    // fp16 on the GPU (fast); 8-bit on WASM (much less memory, so phones with a
+    // tight per-tab memory cap — e.g. iOS Safari — don't get killed mid-load).
+    const dtype = device === "webgpu" ? "fp16" : "q8";
+    setStatus(`Loading models on ${device.toUpperCase()} (${dtype})… (first time downloads weights)`);
+    segPipe   = await pipeline("image-segmentation", SEG_MODEL,   { device, dtype });
+    depthPipe = await pipeline("depth-estimation",   DEPTH_MODEL, { device, dtype });
+    activeDevice = device;
+  };
+
+  // Some browsers (e.g. Safari) expose navigator.gpu but the WebGPU backend
+  // still fails to initialize. Try it, then fall back to WASM on any error.
+  if (navigator.gpu) {
+    try {
+      await tryDevice("webgpu");
+      setStatus("Models ready (WebGPU).");
+      return;
+    } catch (e) {
+      console.warn("WebGPU failed, falling back to WASM:", e);
+      segPipe = null; depthPipe = null;
+    }
+  }
+  await tryDevice("wasm");
+  setStatus("Models ready (WASM — slower).");
+}
+
+// --- fusion (port of perception.py fuse() at WORK resolution) --------------
+// Inputs are typed arrays of length W*H (row-major). depth01: 0=far..1=near.
+function estimateGroundProfile(depth01, ground, W, H) {
+  const profile = new Float32Array(H).fill(NaN);
+  const buf = new Float32Array(W);
+  for (let r = 0; r < H; r++) {
+    let m = 0;
+    for (let c = 0; c < W; c++) if (ground[r*W + c]) buf[m++] = depth01[r*W + c];
+    if (m >= MIN_GROUND_PX) {
+      const s = buf.slice(0, m).sort();
+      profile[r] = (m & 1) ? s[(m-1)>>1] : 0.5*(s[m/2 - 1] + s[m/2]);
+    }
+  }
+  // Linear-interpolate rows with no ground pixels.
+  const known = [];
+  for (let r = 0; r < H; r++) if (!Number.isNaN(profile[r])) known.push(r);
+  if (known.length < 2) return null;
+  for (let r = 0; r < H; r++) {
+    if (Number.isNaN(profile[r])) {
+      // find bracketing known rows
+      let lo = known[0], hi = known[known.length-1];
+      for (let k = 0; k < known.length; k++) {
+        if (known[k] <= r) lo = known[k];
+        if (known[k] >= r) { hi = known[k]; break; }
+      }
+      profile[r] = (hi === lo) ? profile[lo]
+        : profile[lo] + (profile[hi]-profile[lo]) * (r-lo)/(hi-lo);
+    }
+  }
+  // Light vertical smoothing (box filter), k = max(3, H/60).
+  const k = Math.max(3, Math.floor(H/60));
+  const out = new Float32Array(H);
+  const half = (k/2) | 0;
+  for (let r = 0; r < H; r++) {
+    let acc = 0, cnt = 0;
+    for (let d = -half; d <= half; d++) {
+      const rr = r + d;
+      if (rr >= 0 && rr < H) { acc += profile[rr]; cnt++; }
+    }
+    out[r] = acc / cnt;
+  }
+  return out;
+}
+
+function fuse(seg, depth01, W, H) {
+  // seg: Int8Array of category codes: 0=other,1=walkable,2=road,3=terrain
+  const walkable = new Uint8Array(W*H);
+  const ground   = new Uint8Array(W*H);
+  for (let i = 0; i < W*H; i++) {
+    const s = seg[i];
+    if (s === 1) walkable[i] = 1;
+    if (s === 1 || s === 2 || s === 3) ground[i] = 1;
+  }
+
+  // Geometric obstacles: pixels nearer than the ground plane at their row.
+  const obstacle = new Uint8Array(W*H);
+  const profile = estimateGroundProfile(depth01, ground, W, H);
+  if (profile) {
+    for (let r = 0; r < H; r++) {
+      const thr = profile[r] + GROUND_MARGIN_REL;
+      for (let c = 0; c < W; c++) {
+        const i = r*W + c;
+        if (!ground[i] && depth01[i] > thr) obstacle[i] = 1;
+      }
+    }
+  }
+
+  // Nearest obstacle within the walkable corridor: per row, scan only the
+  // column band spanned by walkable pixels.
+  let nearest = null, bestDepth = -1;
+  for (let r = 0; r < H; r++) {
+    let minc = -1, maxc = -1;
+    for (let c = 0; c < W; c++) {
+      if (walkable[r*W + c]) { if (minc < 0) minc = c; maxc = c; }
+    }
+    if (minc < 0) continue;
+    for (let c = minc; c <= maxc; c++) {
+      const i = r*W + c;
+      if (obstacle[i] && depth01[i] > bestDepth) {
+        bestDepth = depth01[i];
+        nearest = { distance_rel: +depth01[i].toFixed(3), column_frac: +(c/W).toFixed(3) };
+      }
+    }
+  }
+
+  // Centerline sampled bottom -> top.
+  const centerline = [];
+  const step = Math.max(1, Math.floor(H/40));
+  for (let r = H-1; r >= 0; r -= step) {
+    let sum = 0, cnt = 0;
+    for (let c = 0; c < W; c++) if (walkable[r*W + c]) { sum += c; cnt++; }
+    if (cnt) centerline.push([r, Math.round(sum/cnt)]);
+  }
+
+  return { seg, W, H, centerline, nearest };
+}
+
+// --- run both models on one canvas frame, return aligned WORK-size data -----
+async function perceive(srcCanvas) {
+  const img = await RawImage.fromCanvas(srcCanvas);   // WORK-size RGB
+
+  const [segOut, depthOut] = await Promise.all([
+    segPipe(img),
+    depthPipe(img),
+  ]);
+
+  const W = srcCanvas.width, H = srcCanvas.height;
+
+  // Build per-pixel category codes from the per-class masks.
+  const seg = new Int8Array(W*H);
+  for (const { label, mask } of segOut) {
+    const cat = categorize(label);
+    if (!cat) continue;
+    const code = cat === "walkable" ? 1 : cat === "road" ? 2 : 3;
+    const md = mask.data;                 // single channel, mask size == img size
+    // mask may differ in size if model padded; assume == W*H (it is, for SegFormer)
+    for (let i = 0; i < md.length; i++) if (md[i]) seg[i] = code;
+  }
+
+  // Depth: RawImage single channel, normalized; larger value = nearer.
+  const dimg = depthOut.depth;            // RawImage at input size
+  const dd = dimg.data;
+  const ch = dimg.channels || 1;
+  const depth01 = new Float32Array(W*H);
+  for (let i = 0; i < W*H; i++) depth01[i] = dd[i*ch] / 255;
+
+  return fuse(seg, depth01, W, H);
+}
+
+// --- overlay drawing (port of live_view.py overlay) ------------------------
+function drawOverlay(displayCtx, dw, dh, r) {
+  const { seg, W, H, centerline, nearest } = r;
+  const sx = dw / W, sy = dh / H;
+
+  // Filled regions via a small ImageData then scaled up.
+  const off = drawOverlay._off ||= document.createElement("canvas");
+  off.width = W; off.height = H;
+  const octx = off.getContext("2d");
+  const imgData = octx.createImageData(W, H);
+  const p = imgData.data;
+  for (let i = 0; i < W*H; i++) {
+    let col = null;
+    const s = seg[i];
+    if (s === 2 || s === 3) col = CYAN;
+    if (s === 1) col = GREEN;            // sidewalk wins overlaps
+    if (col) {
+      p[i*4] = col[0]; p[i*4+1] = col[1]; p[i*4+2] = col[2]; p[i*4+3] = 115;
+    }
+  }
+  octx.putImageData(imgData, 0, 0);
+  displayCtx.imageSmoothingEnabled = true;
+  displayCtx.drawImage(off, 0, 0, W, H, 0, 0, dw, dh);
+
+  // Direction arrow up the centerline.
+  if (centerline.length >= 2) {
+    displayCtx.strokeStyle = `rgb(${ORANGE.join(",")})`;
+    displayCtx.lineWidth = Math.max(6, dw*0.03);
+    displayCtx.lineJoin = "round"; displayCtx.lineCap = "round";
+    displayCtx.beginPath();
+    centerline.forEach(([row, c], k) => {
+      const x = c*sx, y = row*sy;
+      k ? displayCtx.lineTo(x, y) : displayCtx.moveTo(x, y);
+    });
+    displayCtx.stroke();
+    // arrowhead at the last (top) point
+    const [r0, c0] = centerline[centerline.length-1];
+    const [r1, c1] = centerline[centerline.length-2];
+    const dx = (c0-c1)*sx, dy = (r0-r1)*sy;
+    const n = Math.hypot(dx, dy) || 1;
+    const ux = dx/n, uy = dy/n, px = -uy, py = ux;
+    const tipX = c0*sx, tipY = r0*sy;
+    const hl = dw*0.05, hw = dw*0.035;
+    displayCtx.fillStyle = `rgb(${ORANGE.join(",")})`;
+    displayCtx.beginPath();
+    displayCtx.moveTo(tipX + ux*hl, tipY + uy*hl);
+    displayCtx.lineTo(tipX + px*hw, tipY + py*hw);
+    displayCtx.lineTo(tipX - px*hw, tipY - py*hw);
+    displayCtx.closePath();
+    displayCtx.fill();
+  }
+
+  // Nearest obstacle marker.
+  if (nearest) {
+    const x = nearest.column_frac * dw;
+    displayCtx.strokeStyle = `rgb(${RED.join(",")})`;
+    displayCtx.lineWidth = 5;
+    displayCtx.beginPath();
+    displayCtx.moveTo(x, dh-40); displayCtx.lineTo(x, dh); displayCtx.stroke();
+    displayCtx.fillStyle = `rgb(${RED.join(",")})`;
+    displayCtx.font = "bold 16px system-ui";
+    displayCtx.fillText(`OBSTACLE ${nearest.distance_rel.toFixed(2)}`, x-70, dh-48);
+  }
+
+  // Legend chips.
+  const present = [];
+  let hasW=false, hasC=false;
+  for (let i = 0; i < W*H; i++) { if (seg[i]===1) hasW=true; else if (seg[i]===2||seg[i]===3) hasC=true; }
+  if (hasW) present.push(["Sidewalk", GREEN]);
+  if (hasC) present.push(["Road / Terrain", CYAN]);
+  let lx = 10;
+  displayCtx.font = "bold 14px system-ui";
+  for (const [text, col] of present) {
+    const tw = displayCtx.measureText(text).width;
+    displayCtx.fillStyle = "rgba(30,30,30,.6)";
+    displayCtx.fillRect(lx, 10, 26 + tw + 16, 30);
+    displayCtx.fillStyle = `rgb(${col.join(",")})`;
+    displayCtx.fillRect(lx+8, 16, 18, 18);
+    displayCtx.fillStyle = "#fff";
+    displayCtx.fillText(text, lx+32, 30);
+    lx += 26 + tw + 26;
+  }
+}
+
+// --- main loop -------------------------------------------------------------
+const cam = $("cam");
+const view = $("view");
+const vctx = view.getContext("2d");
+const work = document.createElement("canvas");
+const wctx = work.getContext("2d", { willReadFrequently: true });
+
+let running = false;
+
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 } },
+    audio: false,
+  });
+  cam.srcObject = stream;
+  await cam.play();
+}
+
+function sizeCanvases() {
+  const vw = cam.videoWidth, vh = cam.videoHeight;
+  const aspect = vh / vw;
+  work.width = WORK_W;
+  work.height = Math.round(WORK_W * aspect);
+  // Display canvas fills as much of the screen as possible at video aspect.
+  const maxW = window.innerWidth, maxH = window.innerHeight;
+  let dw = maxW, dh = dw * aspect;
+  if (dh > maxH) { dh = maxH; dw = dh / aspect; }
+  view.width = Math.round(dw);
+  view.height = Math.round(dh);
+}
+
+async function loop() {
+  if (!running) return;
+  if (cam.readyState >= 2) {
+    if (work.width === 0 || view.width === 0) sizeCanvases();
+    // Downscale current frame into the work canvas for inference.
+    wctx.drawImage(cam, 0, 0, work.width, work.height);
+    const t0 = performance.now();
+    try {
+      const result = await perceive(work);
+      // Draw the live frame, then the overlay on top.
+      vctx.drawImage(cam, 0, 0, view.width, view.height);
+      drawOverlay(vctx, view.width, view.height, result);
+      const ms = performance.now() - t0;
+      hud.textContent = `${(1000/ms).toFixed(1)} fps · ${ms|0} ms · ${activeDevice}`;
+    } catch (e) {
+      hud.textContent = "error: " + e.message;
+      console.error(e);
+    }
+  }
+  // Yield, then go again as fast as the device allows.
+  requestAnimationFrame(loop);
+}
+
+$("start").addEventListener("click", async () => {
+  $("start").disabled = true;
+  try {
+    setStatus("Requesting camera…");
+    await startCamera();
+    await loadModels();
+    sizeCanvases();
+    $("panel").classList.add("hidden");
+    running = true;
+    loop();
+  } catch (e) {
+    setStatus("Failed: " + e.message);
+    $("start").disabled = false;
+    console.error(e);
+  }
+});
+
+window.addEventListener("resize", () => { if (running) sizeCanvases(); });
+</script>
+</body>
+</html>

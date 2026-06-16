@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Model / HF caches (weights are downloaded at runtime, never committed)
+.cache/
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+# Media / scratch (don't commit large videos or sample frames)
+*.mp4
+*.mov
+*.avi
+*.jpg
+*.jpeg
+*.png
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
