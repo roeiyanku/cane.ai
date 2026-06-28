@@ -78,8 +78,9 @@ import {
 env.allowLocalModels = false;
 
 // ---- models (swap here if you want a heavier/lighter checkpoint) ----------
-// b0 is the light ADE SegFormer; bump to b2 for quality at a big speed cost.
-const SEG_MODEL   = "Xenova/segformer-b0-finetuned-ade-512-512";
+// b1 is the speed/accuracy middle ground for phones: clearly better than b0 at
+// finding the path/road, much faster than b2. (b0 = fastest, b2 = most accurate.)
+const SEG_MODEL   = "Xenova/segformer-b1-finetuned-ade-512-512";
 const DEPTH_MODEL = "onnx-community/depth-anything-v2-small";
 
 // Working resolution for fusion. Small = fast; the camera is downscaled to
@@ -91,8 +92,8 @@ const GROUND_MARGIN_REL = 0.12;
 const MIN_GROUND_PX = 8;
 
 // Overlay colors. live_view.py uses BGR; here we use plain RGB.
-const GREEN  = [60, 200, 60];    // sidewalk
-const CYAN   = [50, 190, 220];   // road / terrain
+const GREEN  = [60, 200, 60];    // sidewalk fill
+const CYAN   = [50, 190, 220];   // road / terrain fill
 const ORANGE = [255, 140, 0];    // direction arrow
 const RED     = [230, 60, 60];   // obstacle
 
@@ -186,6 +187,30 @@ function estimateGroundProfile(depth01, ground, W, H) {
   return out;
 }
 
+// Bounding boxes around connected blobs of an obstacle mask (flood fill).
+function obstacleBoxes(mask, W, H, minArea) {
+  const seen = new Uint8Array(W * H);
+  const boxes = [];
+  const stack = [];
+  for (let s = 0; s < W * H; s++) {
+    if (!mask[s] || seen[s]) continue;
+    let minx = W, miny = H, maxx = 0, maxy = 0, area = 0;
+    stack.push(s); seen[s] = 1;
+    while (stack.length) {
+      const j = stack.pop(), x = j % W, y = (j / W) | 0;
+      area++;
+      if (x < minx) minx = x; if (x > maxx) maxx = x;
+      if (y < miny) miny = y; if (y > maxy) maxy = y;
+      if (x > 0     && mask[j-1] && !seen[j-1]) { seen[j-1] = 1; stack.push(j-1); }
+      if (x < W-1   && mask[j+1] && !seen[j+1]) { seen[j+1] = 1; stack.push(j+1); }
+      if (y > 0     && mask[j-W] && !seen[j-W]) { seen[j-W] = 1; stack.push(j-W); }
+      if (y < H-1   && mask[j+W] && !seen[j+W]) { seen[j+W] = 1; stack.push(j+W); }
+    }
+    if (area >= minArea) boxes.push({ minx, miny, maxx, maxy });
+  }
+  return boxes;
+}
+
 function fuse(seg, depth01, W, H) {
   // seg: Int8Array of category codes: 0=other,1=walkable,2=road,3=terrain
   const walkable = new Uint8Array(W*H);
@@ -209,8 +234,9 @@ function fuse(seg, depth01, W, H) {
     }
   }
 
-  // Nearest obstacle within the walkable corridor: per row, scan only the
-  // column band spanned by walkable pixels.
+  // Restrict obstacles to the walkable corridor (per row, the band spanned by
+  // walkable pixels); track the nearest one and a corridor-only obstacle mask.
+  const corridorObs = new Uint8Array(W*H);
   let nearest = null, bestDepth = -1;
   for (let r = 0; r < H; r++) {
     let minc = -1, maxc = -1;
@@ -220,12 +246,18 @@ function fuse(seg, depth01, W, H) {
     if (minc < 0) continue;
     for (let c = minc; c <= maxc; c++) {
       const i = r*W + c;
-      if (obstacle[i] && depth01[i] > bestDepth) {
-        bestDepth = depth01[i];
-        nearest = { distance_rel: +depth01[i].toFixed(3), column_frac: +(c/W).toFixed(3) };
+      if (obstacle[i]) {
+        corridorObs[i] = 1;
+        if (depth01[i] > bestDepth) {
+          bestDepth = depth01[i];
+          nearest = { distance_rel: +depth01[i].toFixed(3), column_frac: +(c/W).toFixed(3) };
+        }
       }
     }
   }
+
+  // Box the obstacle blobs (drop tiny specks of noise).
+  const boxes = obstacleBoxes(corridorObs, W, H, Math.round(W*H*0.0012));
 
   // Centerline sampled bottom -> top.
   const centerline = [];
@@ -236,7 +268,7 @@ function fuse(seg, depth01, W, H) {
     if (cnt) centerline.push([r, Math.round(sum/cnt)]);
   }
 
-  return { seg, W, H, centerline, nearest };
+  return { seg, W, H, centerline, nearest, boxes };
 }
 
 // --- run both models on one canvas frame, return aligned WORK-size data -----
@@ -271,44 +303,53 @@ async function perceive(srcCanvas) {
   return fuse(seg, depth01, W, H);
 }
 
-// --- overlay drawing (port of live_view.py overlay) ------------------------
-function drawOverlay(displayCtx, dw, dh, r) {
-  const { seg, W, H, centerline, nearest } = r;
-  const sx = dw / W, sy = dh / H;
-
-  // Filled regions via a small ImageData then scaled up.
-  const off = drawOverlay._off ||= document.createElement("canvas");
-  off.width = W; off.height = H;
-  const octx = off.getContext("2d");
-  const imgData = octx.createImageData(W, H);
-  const p = imgData.data;
-  for (let i = 0; i < W*H; i++) {
-    let col = null;
+// Build the region overlay (translucent fills) once per perception result.
+// Walkable path = green, road/terrain = cyan.
+function buildRegions(seg, W, H) {
+  const cv = document.createElement("canvas");
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext("2d");
+  const id = ctx.createImageData(W, H);
+  const p = id.data;
+  let hasW = false, hasC = false;
+  for (let i = 0; i < W * H; i++) {
     const s = seg[i];
-    if (s === 2 || s === 3) col = CYAN;
-    if (s === 1) col = GREEN;            // sidewalk wins overlaps
+    let col = null;
+    if (s === 2 || s === 3) { col = CYAN; hasC = true; }
+    if (s === 1) { col = GREEN; hasW = true; }     // sidewalk wins overlaps
     if (col) {
       p[i*4] = col[0]; p[i*4+1] = col[1]; p[i*4+2] = col[2]; p[i*4+3] = 115;
     }
   }
-  octx.putImageData(imgData, 0, 0);
-  displayCtx.imageSmoothingEnabled = true;
-  displayCtx.drawImage(off, 0, 0, W, H, 0, 0, dw, dh);
+  ctx.putImageData(id, 0, 0);
+  return { bmp: cv, hasW, hasC };
+}
 
-  // Direction arrow up the centerline.
-  if (centerline.length >= 2) {
+// --- overlay drawing (port of live_view.py overlay) ------------------------
+function drawOverlay(displayCtx, dw, dh, r) {
+  const { seg, W, H, centerline, nearest, boxes } = r;
+  const sx = dw / W, sy = dh / H;
+
+  // Region fill + edge outlines — built once per result, then just scaled up.
+  if (!r._vis) r._vis = buildRegions(seg, W, H);
+  displayCtx.imageSmoothingEnabled = true;
+  displayCtx.drawImage(r._vis.bmp, 0, 0, W, H, 0, 0, dw, dh);
+
+  // Direction arrow — only the lower part of the path, so it stays short.
+  const apts = centerline.slice(0, Math.max(2, Math.round(centerline.length * 0.4)));
+  if (apts.length >= 2) {
     displayCtx.strokeStyle = `rgb(${ORANGE.join(",")})`;
     displayCtx.lineWidth = Math.max(6, dw*0.03);
     displayCtx.lineJoin = "round"; displayCtx.lineCap = "round";
     displayCtx.beginPath();
-    centerline.forEach(([row, c], k) => {
+    apts.forEach(([row, c], k) => {
       const x = c*sx, y = row*sy;
       k ? displayCtx.lineTo(x, y) : displayCtx.moveTo(x, y);
     });
     displayCtx.stroke();
     // arrowhead at the last (top) point
-    const [r0, c0] = centerline[centerline.length-1];
-    const [r1, c1] = centerline[centerline.length-2];
+    const [r0, c0] = apts[apts.length-1];
+    const [r1, c1] = apts[apts.length-2];
     const dx = (c0-c1)*sx, dy = (r0-r1)*sy;
     const n = Math.hypot(dx, dy) || 1;
     const ux = dx/n, uy = dy/n, px = -uy, py = ux;
@@ -323,24 +364,24 @@ function drawOverlay(displayCtx, dw, dh, r) {
     displayCtx.fill();
   }
 
-  // Nearest obstacle marker.
-  if (nearest) {
-    const x = nearest.column_frac * dw;
+  // Obstacle boxes: a thin red rectangle around each obstacle blob on the path.
+  if (boxes && boxes.length) {
     displayCtx.strokeStyle = `rgb(${RED.join(",")})`;
-    displayCtx.lineWidth = 5;
-    displayCtx.beginPath();
-    displayCtx.moveTo(x, dh-40); displayCtx.lineTo(x, dh); displayCtx.stroke();
+    displayCtx.lineWidth = 3;
+    displayCtx.font = "bold 14px system-ui";
     displayCtx.fillStyle = `rgb(${RED.join(",")})`;
-    displayCtx.font = "bold 16px system-ui";
-    displayCtx.fillText(`OBSTACLE ${nearest.distance_rel.toFixed(2)}`, x-70, dh-48);
+    for (const b of boxes) {
+      const x = b.minx*sx, y = b.miny*sy;
+      const w = (b.maxx-b.minx)*sx, h = (b.maxy-b.miny)*sy;
+      displayCtx.strokeRect(x, y, w, h);
+    }
+    if (nearest) displayCtx.fillText(`nearest ${nearest.distance_rel.toFixed(2)}`, 10, dh-12);
   }
 
-  // Legend chips.
+  // Legend chips (presence flags computed once in buildRegions).
   const present = [];
-  let hasW=false, hasC=false;
-  for (let i = 0; i < W*H; i++) { if (seg[i]===1) hasW=true; else if (seg[i]===2||seg[i]===3) hasC=true; }
-  if (hasW) present.push(["Sidewalk", GREEN]);
-  if (hasC) present.push(["Road / Terrain", CYAN]);
+  if (r._vis.hasW) present.push(["Sidewalk", GREEN]);
+  if (r._vis.hasC) present.push(["Road / Terrain", CYAN]);
   let lx = 10;
   displayCtx.font = "bold 14px system-ui";
   for (const [text, col] of present) {
@@ -386,27 +427,42 @@ function sizeCanvases() {
   view.height = Math.round(dh);
 }
 
-async function loop() {
+// Latest perception result, shared between the two loops below.
+let latestResult = null;
+
+// Render loop: runs every animation frame so the VIDEO stays smooth, drawing
+// the live camera plus whatever the most recent perception result was. This is
+// decoupled from inference, so a slow model no longer freezes the picture.
+function renderLoop() {
   if (!running) return;
   if (cam.readyState >= 2) {
-    if (work.width === 0 || view.width === 0) sizeCanvases();
-    // Downscale current frame into the work canvas for inference.
-    wctx.drawImage(cam, 0, 0, work.width, work.height);
-    const t0 = performance.now();
-    try {
-      const result = await perceive(work);
-      // Draw the live frame, then the overlay on top.
-      vctx.drawImage(cam, 0, 0, view.width, view.height);
-      drawOverlay(vctx, view.width, view.height, result);
-      const ms = performance.now() - t0;
-      hud.textContent = `${(1000/ms).toFixed(1)} fps · ${ms|0} ms · ${activeDevice}`;
-    } catch (e) {
-      hud.textContent = "error: " + e.message;
-      console.error(e);
+    if (view.width === 0) sizeCanvases();
+    vctx.drawImage(cam, 0, 0, view.width, view.height);
+    if (latestResult) drawOverlay(vctx, view.width, view.height, latestResult);
+  }
+  requestAnimationFrame(renderLoop);
+}
+
+// Perception loop: runs the models back-to-back as fast as the device allows,
+// updating `latestResult`. Independent of the render loop's frame rate.
+async function perceptionLoop() {
+  while (running) {
+    if (cam.readyState >= 2) {
+      if (work.width === 0) sizeCanvases();
+      wctx.drawImage(cam, 0, 0, work.width, work.height);
+      const t0 = performance.now();
+      try {
+        latestResult = await perceive(work);
+        const ms = performance.now() - t0;
+        hud.textContent = `${(1000/ms).toFixed(1)} infer/s · ${ms|0} ms · ${activeDevice}`;
+      } catch (e) {
+        hud.textContent = "error: " + e.message;
+        console.error(e);
+      }
+    } else {
+      await new Promise(res => setTimeout(res, 50));
     }
   }
-  // Yield, then go again as fast as the device allows.
-  requestAnimationFrame(loop);
 }
 
 $("start").addEventListener("click", async () => {
@@ -418,7 +474,8 @@ $("start").addEventListener("click", async () => {
     sizeCanvases();
     $("panel").classList.add("hidden");
     running = true;
-    loop();
+    renderLoop();        // smooth video
+    perceptionLoop();    // models in the background
   } catch (e) {
     setStatus("Failed: " + e.message);
     $("start").disabled = false;
