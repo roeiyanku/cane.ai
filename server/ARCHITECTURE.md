@@ -1,36 +1,38 @@
-# cane.ai — End-to-End Architecture
+# cane.ai — End-to-End Architecture (camera-only)
 
 A **robotic guide-dog** for blind and low-vision users: a motorized, wheeled
-device with an onboard camera and LiDAR, driven by an NVIDIA Jetson. It does not
-tell the user where to go — the user already knows the route. It **physically
-leads them along the walkable path and keeps them out of danger**, exactly like a
-guide dog: the user holds the handle and follows; the device walks the line,
-avoids obstacles, stops at curbs and roads, and refuses any move that would hurt
-them.
+device driven by an **NVIDIA Jetson with a single RGB camera** — **no LiDAR**.
+It doesn't tell the user where to go (they know the route); it **leads them along
+the walkable path and keeps them out of danger**, like a guide dog. The user
+holds the handle and follows; the device walks the line, avoids obstacles on the
+path, and signals when to stop.
 
-> **This supersedes the earlier "phone app + audio cues + GPS" architecture.**
-> The product is not a phone app and not a turn-by-turn navigator. It is an
-> actuated assistive robot running on embedded hardware. The data/training and
-> licensing material from the old doc survives (Layers 7–8 below); everything
-> about the runtime is new.
+> **Scope note: camera only, at least for now.** Everything below is built around
+> one camera. There is no LiDAR and no metric depth. This is deliberate (cost,
+> simplicity), and it has real consequences — see **"What camera-only costs you"**
+> below. LiDAR is the natural future upgrade, not a current dependency.
+>
+> The `webapp/` phone app is a **working camera-only demo** of the perception:
+> it runs the same two models in a phone browser and shows the path/road
+> segmentation and on-path obstacles live from the camera.
 
 ---
 
 ## ⚠️ Safety is the architecture, not a section
 
-This device **moves a person who cannot see what it is about to do.** A wrong
-action can put someone into traffic or off a curb. Three consequences shape every
-layer:
+This device **moves a person who cannot see what it is about to do.** With a
+single camera (no metric depth), the system is *less certain* than a LiDAR rig
+would be, so safety leans even harder on three rules:
 
-1. **Fail safe, fail loud.** When any sensor drops, a frame goes stale, depth is
-   sparse, or perception confidence is low → **stop and signal**. Never guess
-   while in motion.
-2. **Intelligent disobedience.** Like a trained guide dog, the device **refuses**
-   a user's commanded turn if it leads into a road, an obstacle, or a drop-off.
-   The safety supervisor can override the user *and* the planner.
-3. **The human is always in control of last resort.** The device leads gently; it
-   must never drag. The user can always physically resist or stop it, and a
-   hardware kill is within reach.
+1. **Fail safe, fail loud.** When the camera is uncertain (low confidence, glare,
+   the path disappears), **slow and stop, signal** — never guess while moving.
+2. **Intelligent disobedience.** Like a guide dog, it **refuses** a commanded move
+   that heads into the road or an obstacle on the path.
+3. **The human is always in control of last resort.** It leads gently, never
+   drags; the user can always physically resist or stop it, and a hardware kill
+   is within reach.
+4. **Go slow.** Because camera-only depth is unreliable for drop-offs (see below),
+   conservative speed is a safety feature, not a limitation.
 
 Nothing here is for unsupervised real-world use without staged testing, safety
 validation, and the company's own liability/regulatory review.
@@ -39,45 +41,38 @@ validation, and the company's own liability/regulatory review.
 
 ## What the device does (interaction model)
 
-The "leash" model — device leads, user follows — split into two timescales:
+The "leash" model — device leads, user follows — on two timescales:
 
-- **Continuous (the device's job).** Lead down the walkable corridor: set heading
-  along the sidewalk centerline, avoid obstacles, automatically slow and stop at
-  drop-offs and road edges. The user just holds the handle and walks — no
-  micro-steering.
-- **Discrete (the user's job).** At junctions, the user issues the route decision
-  ("turn left," "cross now") via a simple control. The device executes it **only
-  if safe**, otherwise holds position and signals. The user supplies the *where*;
-  the device supplies the *safe how*.
+- **Continuous (device):** lead down the walkable corridor — set heading along the
+  path centerline, avoid obstacles **on the path**, slow/stop when the path is
+  blocked or unclear. The user just holds the handle and walks; no micro-steering.
+- **Discrete (user):** at junctions the user calls the route ("turn left", "cross
+  now"). The device executes it **only if safe**, else holds and signals.
 
-Because the user owns the route, the system needs **no map, no GPS, no SLAM, no
-global path planner.** It is a **local, reactive, shared-control** system.
+No map, no GPS, no global planner — a **local, reactive, shared-control** system.
 
 ---
 
-## System overview (the control loop, ~10 Hz)
+## System overview (camera-only loop, runs on the Jetson)
 
 ```
                           ┌─────────────────────────────────────┐
    USER (route intent) ──►│ holds handle + walks; calls turns     │
-                          │ at junctions ("left", "cross")        │
                           └──────────────┬──────────────────────┘
-        SENSING            WORLD MODEL    │ desired turn / go-stop      ACTUATION
-  Camera ─► seg ─────┐                    ▼
-                     ├─► local BEV ──► ┌─────────────────────────────┐
-  LiDAR ─► geometry  │   costmap       │ Shared-control law:           │─► wheel motors
-        ├ rising  → obstacle (lethal)  │  • lead along walkable        │   (lead/correct,
-        ├ falling → drop-off  (lethal) │    centerline                 │    never drag)
-        └ road (seg)        → lethal   │  • bias by user turn intent   │
-                     │                 │  • INTELLIGENT DISOBEDIENCE   │─► haptics
-  IMU + encoders ─► odometry           │    (veto unsafe moves)        │   (turn / stop /
-                     └─────────────────┴───────────┬───────────────────┘    "blocked" cues)
-                                                   │
-                          ┌──────────────────────────────────────────┐
-                          │ SAFETY SUPERVISOR (authority over all)     │
-                          │ E-stop · speed cap · decel limit · user    │
-                          │ clutch · sensor watchdog · confidence gate │
-                          └──────────────────────────────────────────┘
+        SENSING            PERCEPTION     │ turn / go-stop          ACTUATION
+  ┌──────────┐        ┌───────────────────▼──────────────┐
+  │  Camera  │──RGB──►│ Segmentation → path vs road       │──► wheel motors
+  │  (RGB)   │        │ Monocular depth → relative "how    │    (lead / correct,
+  └──────────┘        │   far / what rises off the ground" │     never drag)
+                      │ → walkable corridor + centerline   │
+                      │ → obstacles ON THE PATH only       │──► haptics
+                      └───────────────┬───────────────────┘    (turn / stop /
+                                      │                          "blocked" cues)
+                          ┌───────────────────────────────────┐
+                          │ SAFETY SUPERVISOR (overrides all)  │
+                          │ E-stop · speed cap · user clutch · │
+                          │ confidence gate · go-slow          │
+                          └───────────────────────────────────┘
 ```
 
 ---
@@ -86,220 +81,132 @@ global path planner.** It is a **local, reactive, shared-control** system.
 
 | Component | Role |
 |---|---|
-| **Camera (RGB)** | Semantic understanding — what is walkable (sidewalk / path / crossing) vs road |
-| **LiDAR** | Metric 3D geometry — obstacles, ground plane, **drop-offs**; the source of real distances |
-| **IMU + wheel encoders** | Odometry — keeps the local costmap stable as the device moves |
-| **NVIDIA Jetson** | Onboard CUDA compute; runs perception + control in real time, fully offline |
-| **Drive base + handle** | Differential-drive wheels (lead/steer) + handle for the user; haptic actuator(s) |
-
-The specific Jetson (Orin Nano/NX vs AGX Orin vs Xavier) sets the optimization
-budget: FP16 on AGX-class, INT8 + a lighter segmentation model on Nano-class.
+| **Camera (RGB)** | The *only* sensor — sidewalk/road understanding **and** rough depth |
+| **NVIDIA Jetson** | Onboard CUDA compute; runs perception + control in real time, offline |
+| **Drive base + handle** | Differential-drive wheels + a handle for the user; haptic actuator(s) |
+| *(future) LiDAR* | Not present. Would add metric distance + reliable curb detection. |
 
 ---
 
-## Layer 1 — Sensing & time sync
+## Layer 1 — Sensing
+One RGB camera, mounted to see the path ahead. Output: a stream of frames. That's
+it — the whole system is monocular.
 
-Produce, every cycle, a **synchronized** bundle: one RGB frame, one LiDAR scan,
-and the latest odometry, matched by timestamp (or hardware trigger). For a moving
-pedestrian, a few hundred ms of camera/LiDAR skew puts obstacles in the wrong
-place — sync is a correctness requirement, not a nicety.
+## Layer 2 — Perception
+Two models on each frame (the same ones the `webapp/` demo and `perception.py`
+run):
 
-**Output:** time-aligned `(rgb, point_cloud, odom)` tuples.
+1. **Semantic segmentation** (SegFormer) — labels each pixel: **walkable path**
+   vs **road** vs other. This is the **primary signal** and the make-or-break for
+   accuracy. A generic model confuses vegetation/walls for pavement; the fix is
+   **retraining on your own sidewalk footage** (Layer 7).
+2. **Monocular depth** (Depth Anything) — **relative** inverse-depth (ordinal
+   "closer/farther", **not metres**). Used to flag things that **rise above the
+   ground plane within the walkable corridor** = obstacles on the path.
 
----
+**Obstacles only count if they're on the path.** Detections off the walkable
+corridor are ignored — a chair on the sidewalk matters; a wall to the side does
+not. (`fuse()` already gates obstacles to the walkable band.)
 
-## Layer 2 — Calibration & metric depth
+**Output:** the walkable corridor + its centerline (a heading), and the nearest
+on-path obstacle (as a relative, ordinal distance).
 
-One-time **calibration** of camera intrinsics (K) and the LiDAR→camera extrinsics
-(R, t). At runtime, **project the LiDAR point cloud into the camera image** to
-build a metric depth map aligned to the RGB frame.
+## Layer 3 — World model
+Because there's no metric depth, this stays **lightweight and image-relative**
+(not a metric costmap): the walkable corridor, a centerline heading, and on-path
+obstacle flags with ordinal "how close." Good enough for local lead-and-avoid.
 
-This is the layer that lights up the dormant hooks already in
-[`perception.py`](perception.py): `metric_depth_from_sensor()`, the
-`depth_is_metric` flag, `GROUND_MARGIN_M`, and `nearest_obstacle.distance_m`. The
-LiDAR replaces Depth Anything's *relative* inverse-depth as the source of truth;
-monocular depth survives only as an optional densifier when LiDAR returns are
-sparse.
+## Layer 4 — Decision (shared-control law)
+Turn perception + user intent into a safe motion command:
+1. Default heading = follow the path centerline.
+2. Bias by the user's turn intent at junctions.
+3. Slow/stop for obstacles on the path.
+4. **Intelligent disobedience** — refuse a move into the road or a blocked path.
 
-**Output:** a metric (metres) depth map aligned to the camera frame.
+This is exactly the logic validated in `sim/guide_sim.py` (lead / avoid / stop /
+cross), just fed by real perception instead of a drawn world. ROS 2 is a sensible
+backbone but you only need a local controller, not global navigation.
 
----
+## Layer 5 — Safety supervisor & actuation
+A supervisor outside the controller, able to override it and the user:
+- **E-stop / hard speed cap / bounded deceleration**, and a **go-slow** default.
+- **User clutch / override** — the user can always resist or halt.
+- **Confidence gate** — low segmentation confidence, lost path, or glare → stop &
+  signal.
 
-## Layer 3 — Perception
+Gated commands → **wheel motors** (differential drive) and **haptics**
+(lead direction / turn / stop / "blocked").
 
-Two parallel branches fused into a geometric understanding of the scene:
+## Layer 7 — Data (the real accuracy lever)
+With camera-only, accuracy *is* the segmentation model. Mostly existing data
+topped up with **your own sidewalk footage** for the classes generic datasets get
+wrong (curb cuts, crosswalks, regional paving, edges). Label with CVAT/Roboflow.
 
-1. **Semantic segmentation (camera).** What is walkable surface vs **road**. The
-   road/sidewalk boundary is a *safety* boundary here, not cosmetic. For
-   real-time on Jetson this must be a light model (DDRNet / PIDNet / BiSeNet, or
-   at most SegFormer-B0) **exported to TensorRT**. See licensing gate in Layer 7.
-2. **Geometry (LiDAR).** A **RANSAC ground-plane fit** on the point cloud, then:
-   - **Positive obstacles** — points rising above the ground plane (poles,
-     people, bollards). This is the existing
-     [`ground_plane_obstacles`](perception.py) logic, made truly 3D.
-   - **Negative obstacles** — where the ground **falls away**: curbs down,
-     descending stairs, holes. **This is new and is the single most important
-     life-safety feature** — the classic thing a guide dog exists to prevent.
-     The current code only flags rising geometry; a falling-ground branch must be
-     added.
-
-**Output:** classified scene geometry — walkable surface, road, positive
-obstacles, negative obstacles — all in metric coordinates.
-
----
-
-## Layer 4 — World model (BEV costmap)
-
-Project perception into a small **top-down (bird's-eye) costmap** around the
-device — the representation a planner actually consumes (planners think in the
-ground plane, not in pixels):
-
-- walkable corridor → low cost
-- everything else off-corridor → high cost
-- positive/negative obstacles and **road** → lethal (inflated by a safety margin)
-
-**Output:** a rolling local costmap + the walkable centerline as a candidate path.
-
----
-
-## Layer 5 — Decision (shared-control law)
-
-Turn the world model + user intent into a **safe velocity command**:
-
-1. Default heading = follow the walkable centerline.
-2. Bias by the user's discrete turn intent at junctions.
-3. Avoid lethal cells (local reactive avoidance).
-4. **Intelligent disobedience** — if the resulting motion would enter a road,
-   obstacle, or drop-off, refuse it: hold, slow, or stop, and emit a "blocked"
-   cue instead.
-
-ROS 2 is a sensible backbone for wiring this, but you need only the **local
-costmap + a custom controller** — not Nav2's global navigation machinery.
-
-**Output:** a desired `(linear, angular)` velocity, pre-safety-gate.
-
----
-
-## Layer 6 — Safety supervisor & actuation
-
-A supervisor **outside** the planner, with authority to override it and the user:
-
-- **E-stop** on any lethal-range obstacle/edge, regardless of intent.
-- **Hard speed cap** at walking pace; bounded deceleration (no jerk).
-- **User clutch / override** — the user can always resist or halt; the device
-  assists, never drags.
-- **Sensor watchdog & confidence gate** — camera/LiDAR dropout, stale frame,
-  diverging odometry, sparse LiDAR, or low perception confidence → stop & signal.
-
-Gated commands go to:
-- **Wheel motors** (differential-drive kinematics → left/right velocities).
-- **Haptics** — encode lead direction / turn / stop / "blocked" as vibration.
-
-**Output:** safe motor commands + haptic cues to the user.
-
----
-
-## Layer 7 — Data (training the segmentation model)
-
-*(Carried forward from the previous architecture — still valid.)* The model is
-only as good as its data: **mostly existing data, topped up with your own footage**
-for accessibility-specific classes generic datasets handle poorly.
-
-| Dataset | What it gives you | License notes |
-|---|---|---|
-| **Cityscapes** | Urban scenes, sidewalk/road/person/car | Research/non-commercial — **gate before selling** |
-| **Mapillary Vistas** | Large, diverse global street imagery | Research license; commercial tier exists |
-| **SideGuide** | Purpose-built for sidewalk navigation | Verify current license |
-| **ADE20K** | Broad scene parsing, good for pretraining | Permissive-ish; verify |
-
-Your own footage is the differentiator — curb cuts/dropped curbs, crosswalks,
-surface hazards, regional sidewalk materials and edge types. Label with CVAT or
-Roboflow → pixel masks.
-
-> **Dataset/model licensing is a hard commercial gate.** The default checkpoints
-> in `perception.py` are research-only Cityscapes/ADE stand-ins. Before shipping,
-> retrain on data you own or have licensed.
-
----
+> **Licensing is a hard commercial gate.** The default ADE/Cityscapes checkpoints
+> are research-only. Retrain on data you own or have licensed before shipping.
 
 ## Layer 8 — Model training
-
-*(Carried forward.)* **Fine-tune, don't train from scratch.** A real-time
-segmentation backbone adapted to your classes gives the best quality for the
-least compute.
-
-- **Architecture:** prioritize **real-time** (DDRNet/PIDNet/BiSeNet, or
-  SegFormer-B0) — this runs in a control loop on an edge device, not offline.
-- **Framework:** PyTorch + Hugging Face `transformers` (you train/serve it
-  yourself; no hosted API), then **export to TensorRT** for the Jetson.
-- **Evaluation:** mean IoU **per class**, watching safety-critical classes
-  (sidewalk edge, curb cut, road boundary) — a good average can hide a deadly
-  edge-case failure.
-
-**Output:** a TensorRT-optimized segmentation engine + a per-class eval report.
+Fine-tune a **real-time** segmentation backbone (DDRNet/PIDNet/BiSeNet, or
+SegFormer-B0/B1) on your data; export to **TensorRT** for the Jetson. Evaluate
+per-class IoU, watching the safety-critical classes (path edge, road boundary).
 
 ---
 
-## What survives from the current code vs. what's new
+## What camera-only costs you (be honest about this)
 
-**Survives:** the perception core — camera→walkable segmentation, LiDAR→metric
-geometry, ground-plane obstacle fusion. The `Perception` class and `fuse()` are
-the right seam; the `depth_is_metric` / `metric_depth_from_sensor` hooks were
-written for exactly this hardware.
+Dropping LiDAR removes two things that matter for a guide dog:
 
-**New work, roughly in priority order:**
-1. **Negative-obstacle (drop-off) detection** in perception — life-safety.
-2. **Calibration + LiDAR→metric-depth** layer (lights up `depth_is_metric`).
-3. **BEV costmap** output (replace image-mask output for the planner).
-4. **Shared-control law + intelligent disobedience.**
-5. **Safety supervisor** (E-stop, speed/decel limits, watchdog, clutch).
-6. **Actuation** — diff-drive motor control + haptics.
-7. **Real-time** — TensorRT segmentation, pipeline parallelism on the Jetson.
+1. **No metric distance.** You get "closer/farther", not "2.4 m". Fine for
+   relative lead-and-avoid; you can't reason in real units.
+2. **Unreliable curb / drop-off detection.** Spotting where the ground *falls
+   away* (curbs down, steps, holes) — the single most important guide-dog
+   safety job — is **hard and noisy from a single camera**. Monocular depth
+   doesn't give a trustworthy ground plane.
 
----
-
-## Build order (recommended)
-
-1. **Perception upgrade** — add negative-obstacle detection; wire LiDAR metric
-   depth (`depth_is_metric=True`). Validate on logged sensor data, off-vehicle.
-2. **World model** — project to a BEV costmap; visualize it for debugging.
-3. **Control in simulation** — shared-control law + safety supervisor against
-   recorded/sim data before touching motors.
-4. **Bring up actuation** — diff-drive + haptics, with the safety supervisor and
-   a hardware E-stop from day one, at crawl speed, supervised.
-5. **Real-time optimization** — TensorRT, profiling to hold the loop rate.
-6. **Staged real-world testing** — supervised, escalating, with safety/liability
-   review. The value and the risk both live here.
+**Mitigations until/unless LiDAR is added:** conservative speed, aggressive
+fail-safe (stop when unsure), relying on the user's own residual cues at curbs,
+and being explicit that this is a **prototype**, not a validated unsupervised
+guide. The `perception.py` LiDAR hooks (`metric_depth_from_sensor`,
+`depth_is_metric`) stay as the seam for adding LiDAR later.
 
 ---
+
+## What survives in the code / what's new
+- **Survives:** `perception.py` (segmentation + monocular depth + fusion) and the
+  control logic proven in `sim/guide_sim.py` — both are already camera-only.
+- **New work:** robustifying on-path obstacle detection from monocular depth; the
+  shared-control law + safety supervisor; actuation (diff-drive + haptics);
+  TensorRT for real-time; and above all **retraining segmentation on owned data**.
+
+## Build order
+1. **Perception on real footage** — validate path/road segmentation + on-path
+   obstacles on recorded walks (the `webapp/` demo + logged video). De-risk
+   accuracy first.
+2. **Retrain segmentation** on your sidewalk data — the biggest accuracy win.
+3. **Control in sim** — the `sim/` logic is the controller; keep tuning it.
+4. **Actuation bring-up** — diff-drive + haptics, behind the safety supervisor and
+   a hardware E-stop, at crawl speed, supervised.
+5. **Real-time** — TensorRT, profiling to hold the loop rate.
+6. **Staged real-world testing** — supervised, escalating, with safety review.
 
 ## Repository layout (proposed)
-
 ```
 pathsense/
 ├── README.md
 ├── server/ARCHITECTURE.md       ← this file
-├── sensors/                     ← camera + lidar sources, time sync
-├── calib/                       ← intrinsics/extrinsics, cloud→image, metric depth
-├── perception/                  ← seg (TensorRT) + 3D ground plane + obstacles
-│   └── perception.py            ← evolve the existing module here
-├── worldmodel/                  ← BEV costmap builder
+├── server/perception.py         ← segmentation + monocular depth + fusion
+├── server/api.py                ← dev/debug HTTP endpoint
+├── webapp/                      ← working camera-only phone demo (in-browser)
+├── sim/                         ← guide-dog decision-logic simulation
 ├── control/                     ← shared-control law + intelligent disobedience
-├── safety/                      ← supervisor: E-stop, limits, watchdog, clutch
+├── safety/                      ← supervisor: E-stop, limits, confidence gate
 ├── actuation/                   ← diff-drive motor control + haptics
-├── runtime/                     ← the on-device service loop (Jetson)
-├── train/                       ← dataset prep, fine-tuning, eval, TensorRT export
-└── server/api.py                ← kept as a dev/debug entry point only
+└── train/                       ← dataset prep, fine-tuning, eval, TensorRT export
 ```
 
----
-
-## Open questions (to confirm with the company)
-
-- **Jetson model** — sets FP16 vs INT8 and how light the segmentation model must
-  be.
-- **LiDAR output format** — aligned depth image vs raw point cloud, and whether it
-  ships pre-calibrated to the camera (decides how much of Layer 2 you build).
-- **Junction intent input** — the simple control the user uses to call turns.
-- **Drive base** — differential drive assumed; confirm kinematics and the
-  hardware E-stop / clutch mechanism.
+## Open questions
+- Which **Jetson** model (sets the real-time budget).
+- **Junction intent input** — the control the user uses to call turns.
+- **Drive base** — kinematics, hardware E-stop / clutch.
+- **Curb safety** — how to handle drop-offs given no LiDAR (speed limits? user
+  cues? a cheap dedicated down-facing sensor as a middle ground?).
