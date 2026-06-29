@@ -1,5 +1,3 @@
-<img width="1080" height="2400" alt="Screenshot_20260628_183047_Chrome" src="https://github.com/user-attachments/assets/5aec7607-28e7-4034-8974-71c657f68f4d" />
-
 
 # cane.ai
 
@@ -38,6 +36,7 @@ For GitHub Pages hosting, tuning, and device requirements, see
 [`webapp/README.md`](webapp/README.md).
 
 ---
+<img width="1080" height="2400" alt="Screenshot_20260628_183047_Chrome" src="https://github.com/user-attachments/assets/5aec7607-28e7-4034-8974-71c657f68f4d" />
 
 ## Pipeline
 
