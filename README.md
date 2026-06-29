@@ -153,4 +153,4 @@ webapp/              # phone client: both models on-device in the browser
 
 ## Authors
 
-Created by **Roei Yanku** and **Tzvi Lengerman**.
+Created by **Roei Yanku** and **Zvi Lengerman**.
