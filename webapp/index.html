@@ -63,13 +63,27 @@
   </div>
 
 <script type="module">
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // cane.ai — fully on-device perception in the browser.
 //
-// Mirrors server/perception.py (segmentation + depth + fusion) and
-// live_view.py (overlay), but runs the models on the phone via transformers.js
-// + WebGPU. No server, no PC. See README for hosting (needs HTTPS for camera).
-// ---------------------------------------------------------------------------
+// Everything runs on the phone: the camera feeds two AI models, their outputs
+// are fused into navigation info, and that gets drawn over the live video.
+// Your PC only serves this one file — it does none of the thinking.
+//
+// THE PIPELINE, STEP BY STEP (search for "STEP" to jump between them):
+//   Step 1  loadModels()     – download + start the 2 models (once).
+//   Step 2  perceive(frame)  – run both models on one camera frame.
+//   Step 3  fuse(...)        – turn raw output into: walkable path, centerline,
+//                              and obstacles ON the path.
+//                              (helpers: estimateGroundProfile, obstacleBoxes)
+//   Step 4  drawOverlay(...) – paint regions / arrow / boxes on screen.
+//                              (helper: buildRegions)
+//   Step 5  the two loops    – renderLoop draws video every frame; perceptionLoop
+//                              runs Steps 2-3 in the background.
+//
+// Mirrors server/perception.py (segmentation + depth + fusion) and live_view.py
+// (overlay). See README for hosting (the camera needs HTTPS).
+// ===========================================================================
 import {
   pipeline, RawImage, env
 } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0/dist/transformers.min.js";
@@ -77,6 +91,7 @@ import {
 // Cache model weights in the browser; allow remote download from the Hub.
 env.allowLocalModels = false;
 
+// ── Config: models, working resolution, fusion constants, overlay colors ───
 // ---- models (swap here if you want a heavier/lighter checkpoint) ----------
 // b1 is the speed/accuracy middle ground for phones: clearly better than b0 at
 // finding the path/road, much faster than b2. (b0 = fastest, b2 = most accurate.)
@@ -112,10 +127,15 @@ function categorize(label) {
   return null;
 }
 
-let segPipe = null, depthPipe = null;
+// ── Module state (filled in as the app runs) ───────────────────────────────
+let segPipe = null, depthPipe = null;  // the two loaded models (Step 1)
+let activeDevice = "wasm";             // "webgpu" or "wasm" — whichever loaded
+let running = false;                   // true while the loops run (Step 5)
+let latestResult = null;               // most recent perception result (Steps 2-3)
 
-let activeDevice = "wasm";
-
+// ── STEP 1 · Load the two AI models (once) ─────────────────────────────────
+// Downloads the segmentation + depth models from the web (then browser-cached)
+// and starts them on the phone's GPU (WebGPU), falling back to the CPU (WASM).
 async function loadModels() {
   const tryDevice = async (device) => {
     // fp16 on the GPU (fast); 8-bit on WASM (much less memory, so phones with a
@@ -143,8 +163,45 @@ async function loadModels() {
   setStatus("Models ready (WASM — slower).");
 }
 
-// --- fusion (port of perception.py fuse() at WORK resolution) --------------
-// Inputs are typed arrays of length W*H (row-major). depth01: 0=far..1=near.
+// ── STEP 2 · Run both models on one camera frame ───────────────────────────
+// Sends the frame to segmentation + depth (in parallel), turns their outputs
+// into plain arrays, then calls fuse() (Step 3) for the navigation result.
+async function perceive(srcCanvas) {
+  const img = await RawImage.fromCanvas(srcCanvas);   // WORK-size RGB
+
+  const [segOut, depthOut] = await Promise.all([
+    segPipe(img),
+    depthPipe(img),
+  ]);
+
+  const W = srcCanvas.width, H = srcCanvas.height;
+
+  // Build per-pixel category codes from the per-class masks.
+  const seg = new Int8Array(W*H);
+  for (const { label, mask } of segOut) {
+    const cat = categorize(label);
+    if (!cat) continue;
+    const code = cat === "walkable" ? 1 : cat === "road" ? 2 : 3;
+    const md = mask.data;                 // single channel, mask size == img size
+    // mask may differ in size if model padded; assume == W*H (it is, for SegFormer)
+    for (let i = 0; i < md.length; i++) if (md[i]) seg[i] = code;
+  }
+
+  // Depth: RawImage single channel, normalized; larger value = nearer.
+  const dimg = depthOut.depth;            // RawImage at input size
+  const dd = dimg.data;
+  const ch = dimg.channels || 1;
+  const depth01 = new Float32Array(W*H);
+  for (let i = 0; i < W*H; i++) depth01[i] = dd[i*ch] / 255;
+
+  return fuse(seg, depth01, W, H);
+}
+
+// ── STEP 3 helpers · fusion math (port of perception.py) ───────────────────
+// All operate on flat arrays of length W*H (row-major). depth01: 0=far .. 1=near.
+//
+// estimateGroundProfile: for each image row, the typical depth of the GROUND
+// (median of the ground pixels), so anything sticking up closer can be flagged.
 function estimateGroundProfile(depth01, ground, W, H) {
   const profile = new Float32Array(H).fill(NaN);
   const buf = new Float32Array(W);
@@ -187,7 +244,9 @@ function estimateGroundProfile(depth01, ground, W, H) {
   return out;
 }
 
-// Bounding boxes around connected blobs of an obstacle mask (flood fill).
+// obstacleBoxes: group obstacle pixels into connected blobs (flood fill) and
+// return one bounding box per blob — so a chair becomes a single box, and tiny
+// noise specks (smaller than minArea) are dropped.
 function obstacleBoxes(mask, W, H, minArea) {
   const seen = new Uint8Array(W * H);
   const boxes = [];
@@ -211,6 +270,10 @@ function obstacleBoxes(mask, W, H, minArea) {
   return boxes;
 }
 
+// ── STEP 3 · Fuse model outputs into navigation info ───────────────────────
+// In:  per-pixel category (seg) + relative depth.
+// Out: walkable mask, the path centerline, obstacle boxes ON the path, and the
+//      nearest obstacle. (Obstacles off the path are intentionally ignored.)
 function fuse(seg, depth01, W, H) {
   // seg: Int8Array of category codes: 0=other,1=walkable,2=road,3=terrain
   const walkable = new Uint8Array(W*H);
@@ -271,40 +334,9 @@ function fuse(seg, depth01, W, H) {
   return { seg, W, H, centerline, nearest, boxes };
 }
 
-// --- run both models on one canvas frame, return aligned WORK-size data -----
-async function perceive(srcCanvas) {
-  const img = await RawImage.fromCanvas(srcCanvas);   // WORK-size RGB
-
-  const [segOut, depthOut] = await Promise.all([
-    segPipe(img),
-    depthPipe(img),
-  ]);
-
-  const W = srcCanvas.width, H = srcCanvas.height;
-
-  // Build per-pixel category codes from the per-class masks.
-  const seg = new Int8Array(W*H);
-  for (const { label, mask } of segOut) {
-    const cat = categorize(label);
-    if (!cat) continue;
-    const code = cat === "walkable" ? 1 : cat === "road" ? 2 : 3;
-    const md = mask.data;                 // single channel, mask size == img size
-    // mask may differ in size if model padded; assume == W*H (it is, for SegFormer)
-    for (let i = 0; i < md.length; i++) if (md[i]) seg[i] = code;
-  }
-
-  // Depth: RawImage single channel, normalized; larger value = nearer.
-  const dimg = depthOut.depth;            // RawImage at input size
-  const dd = dimg.data;
-  const ch = dimg.channels || 1;
-  const depth01 = new Float32Array(W*H);
-  for (let i = 0; i < W*H; i++) depth01[i] = dd[i*ch] / 255;
-
-  return fuse(seg, depth01, W, H);
-}
-
-// Build the region overlay (translucent fills) once per perception result.
-// Walkable path = green, road/terrain = cyan.
+// ── STEP 4 helper · region overlay bitmap ──────────────────────────────────
+// buildRegions: paint walkable=green / road=cyan into a small image, done once
+// per perception result (cached on it) so the render loop just scales it up.
 function buildRegions(seg, W, H) {
   const cv = document.createElement("canvas");
   cv.width = W; cv.height = H;
@@ -325,7 +357,9 @@ function buildRegions(seg, W, H) {
   return { bmp: cv, hasW, hasC };
 }
 
-// --- overlay drawing (port of live_view.py overlay) ------------------------
+// ── STEP 4 · Draw everything on screen ─────────────────────────────────────
+// Paints the colored regions, the short direction arrow, the red obstacle
+// boxes, and the legend onto the visible canvas.
 function drawOverlay(displayCtx, dw, dh, r) {
   const { seg, W, H, centerline, nearest, boxes } = r;
   const sx = dw / W, sy = dh / H;
@@ -396,15 +430,15 @@ function drawOverlay(displayCtx, dw, dh, r) {
   }
 }
 
-// --- main loop -------------------------------------------------------------
+// ── STEP 5 · Runtime: camera + the two loops ───────────────────────────────
+// "work" canvas = small, fed to the models; "view" canvas = big, shown to user.
 const cam = $("cam");
 const view = $("view");
 const vctx = view.getContext("2d");
 const work = document.createElement("canvas");
 const wctx = work.getContext("2d", { willReadFrequently: true });
 
-let running = false;
-
+// startCamera: ask the phone for its rear camera and start the video stream.
 async function startCamera() {
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 } },
@@ -414,6 +448,8 @@ async function startCamera() {
   await cam.play();
 }
 
+// sizeCanvases: set the small "work" canvas (for the AI) and the big "view"
+// canvas (shown on screen), both matching the camera's aspect ratio.
 function sizeCanvases() {
   const vw = cam.videoWidth, vh = cam.videoHeight;
   const aspect = vh / vw;
@@ -426,9 +462,6 @@ function sizeCanvases() {
   view.width = Math.round(dw);
   view.height = Math.round(dh);
 }
-
-// Latest perception result, shared between the two loops below.
-let latestResult = null;
 
 // Render loop: runs every animation frame so the VIDEO stays smooth, drawing
 // the live camera plus whatever the most recent perception result was. This is
@@ -465,6 +498,7 @@ async function perceptionLoop() {
   }
 }
 
+// The Start button ties it all together: camera → load models → run both loops.
 $("start").addEventListener("click", async () => {
   $("start").disabled = true;
   try {
