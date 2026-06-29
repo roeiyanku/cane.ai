@@ -1,39 +1,45 @@
-# cane.ai — Local Perception Server
+# cane.ai
 
-Monocular perception for assistive pedestrian navigation. A single camera frame
-goes in; sidewalk segmentation, depth, and fused navigation cues come out. No
-third-party inference API — both models run locally.
+**Monocular perception for assistive pedestrian navigation.** A single camera
+frame goes in; sidewalk segmentation, relative depth, and fused navigation cues
+come out. Both models run locally — no third-party inference API.
+
+- 🎥 **Try it on your phone** in under a minute → [Quick start](#quick-start)
+- 🧠 **How it works** → [Pipeline](#pipeline)
+- 🖥️ **Run the perception server** → [Server](#server)
+- ⚠️ **Read before deploying** → [Safety & licensing](#safety--licensing)
 
 ---
 
-## ▶ Run the demo (start here)
+## Quick start
 
-**The demo is [`webapp/index.html`](webapp/index.html).** It runs the whole
-pipeline live on your phone's browser — no PC server, no install.
+The demo is a single page — [`webapp/index.html`](webapp/index.html) — that runs
+the entire pipeline live in your phone's browser. No PC server and no app
+install; both models execute on-device via transformers.js.
 
-> ⚠️ **You CANNOT just double-click `index.html`.** Opening the file directly
-> (`file://`) will **not** get camera access — browsers only allow the camera on
-> a page served over **HTTPS**. You must serve it. Here's the fastest way:
+> **The page must be served over HTTPS.** Browsers only grant camera access in a
+> secure context, so opening `index.html` directly from disk (`file://`) leaves
+> the camera black. Serve it instead:
 
 ```bash
 cd webapp
-python -m http.server 8080                       # serve the page
-npx cloudflared tunnel --url http://localhost:8080   # get an HTTPS URL (new terminal)
+python -m http.server 8080                            # 1. serve the page
+npx cloudflared tunnel --url http://localhost:8080    # 2. expose it over HTTPS (new terminal)
 ```
 
-Then **open the printed `https://...trycloudflare.com` URL on your phone** and
-tap **Start camera**. That's it — both models load on-device the first time
-(~200 MB) and the live overlay appears.
+Open the printed `https://….trycloudflare.com` URL on your phone and tap **Start
+camera**. The models download once (~200 MB) and cache in the browser; the live
+overlay appears after that.
 
-Full options (GitHub Pages, tuning, requirements) are in
+For GitHub Pages hosting, tuning, and device requirements, see
 [`webapp/README.md`](webapp/README.md).
 
 ---
 
-## What it does
+## Pipeline
 
 ```
-  image ──▶ SegFormer ───▶ sidewalk / walkable region
+  image ──▶ SegFormer ──────▶ sidewalk / walkable region
         └─▶ Depth Anything ─▶ per-pixel relative depth
                               │
                               ▼
@@ -41,12 +47,18 @@ Full options (GitHub Pages, tuning, requirements) are in
                                       obstacles on path + relative distance }
 ```
 
-- **Segmentation** (SegFormer) finds the sidewalk and its boundaries.
-- **Depth** (Depth Anything V2) estimates how far things are, from one camera.
-- **Fusion** keeps only obstacles that sit *on the walkable corridor* and reports
-  the nearest one with a relative distance and left/right position.
+| Stage            | Model               | Output                                            |
+| ---------------- | ------------------- | ------------------------------------------------- |
+| **Segmentation** | SegFormer           | Sidewalk / walkable region and its boundaries     |
+| **Depth**        | Depth Anything V2   | Per-pixel relative depth from a single camera     |
+| **Fusion**       | —                   | Nearest obstacle *on the corridor*, with position |
 
-## Run it
+Fusion keeps only the obstacles that sit on the walkable corridor and reports the
+nearest one with a relative distance and a left/right position.
+
+---
+
+## Server
 
 ```bash
 cd pathsense
@@ -54,8 +66,8 @@ pip install -r requirements.txt
 uvicorn server.api:app --host 0.0.0.0 --port 8000
 ```
 
-First request downloads model weights (a few hundred MB) and is slow.
-A **GPU is strongly recommended** — on CPU this is far from real-time.
+The first request downloads model weights (a few hundred MB) and is slow. A
+**GPU is strongly recommended** — on CPU the server is far from real-time.
 
 Test it:
 
@@ -63,7 +75,7 @@ Test it:
 curl -F "file=@frame.jpg" http://localhost:8000/segment | jq '.nearest_obstacle, .walkable_ratio'
 ```
 
-## Response shape
+### Response shape
 
 ```jsonc
 {
@@ -72,48 +84,58 @@ curl -F "file=@frame.jpg" http://localhost:8000/segment | jq '.nearest_obstacle,
   "walkable_ratio": 0.27,
   "obstacle_mask":  [[0,0,...], ...],  // 1 = near object on the path
   "nearest_obstacle": { "distance_rel": 0.9, "column_frac": 0.47 } | null,
-  "centerline": [[row, col], ...]      // sampled bottom→top
+  "centerline": [[row, col], ...]      // sampled bottom → top
 }
 ```
 
-`distance_rel` is **relative** (≈1.0 = very close, 0 = far), normalized per frame.
-It is NOT metres — see "Depth is relative" below.
+`distance_rel` is **relative** (≈1.0 = very close, 0 = far), normalized per
+frame. It is not metres — see [Depth is relative](#depth-is-relative).
 
-## ⚠️ Before any commercial use — read this
-
-1. **Dataset/model licensing is a hard gate.** The default SegFormer checkpoint
-   (`nvidia/segformer-b2-finetuned-cityscapes-...`) is trained on **Cityscapes,
-   which is research / non-commercial.** It is a prototyping stand-in ONLY.
-   For a shipped product, replace it with a model trained on data you own or
-   have licensed. Confirm the Depth Anything variant's license too.
-2. **This is a safety device.** It is intended to *assist* a sighted-capable
-   pipeline, not to be the sole guidance for a blind user crossing real streets.
-   It has had **no real-world safety validation.** Don't deploy it with users
-   without supervised testing and proper review (liability, insurance, possibly
-   regulatory) — that's for the company's counsel, not this README.
-3. **Fail safe, fail loud.** When perception is uncertain (low walkable_ratio,
-   conflicting depth), the downstream system should go quiet and signal
-   uncertainty rather than confidently guide someone.
-
-## Depth is relative, not metric
-
-Depth Anything outputs *relative* inverse-depth. To turn `distance_rel` into
-metres you need calibration — e.g. camera intrinsics + mounting height and a
-ground-plane assumption, or a one-time reference object at known distance. Until
-then, treat distance as ordinal: "closer vs. farther," not "2.4 m."
+---
 
 ## Clients
 
-Two ways to see the perception output:
+| Client                              | Server needed | Notes                                                          |
+| ----------------------------------- | ------------- | -------------------------------------------------------------- |
+| [`live_view.py`](live_view.py)      | Yes           | Desktop: plays a walking video through `/segment` and overlays the navigation cues. Usage is in the module header. |
+| [`webapp/`](webapp/)                | No            | Phone: runs both models on-device in the browser via transformers.js — same overlay, no PC. |
 
-- **Desktop (uses this server):** [`live_view.py`](live_view.py) plays a walking
-  video through `/segment` and draws the navigation overlay. Usage is in its
-  module header.
-- **Phone (no server):** [`webapp/`](webapp/) runs both models fully on-device in
-  the browser via transformers.js — same overlay, no PC needed. See
-  [`webapp/README.md`](webapp/README.md).
+---
 
-## Files
+## Depth is relative
+
+Depth Anything outputs *relative* inverse-depth. Converting `distance_rel` into
+metres requires calibration — e.g. camera intrinsics plus mounting height and a
+ground-plane assumption, or a one-time reference object at a known distance.
+Until calibrated, treat distance as ordinal ("closer vs. farther"), not metric.
+
+---
+
+## Safety & licensing
+
+This is a research prototype. Read this section before any deployment or
+commercial use.
+
+1. **Model licensing is a hard gate.** The default SegFormer checkpoint
+   (`nvidia/segformer-b2-finetuned-cityscapes-…`) is trained on Cityscapes, which
+   is research / non-commercial. It is a prototyping stand-in only. A shipped
+   product must replace it with a model trained on data you own or have licensed;
+   confirm the Depth Anything variant's license as well.
+
+2. **This is a safety device.** It is intended to *assist* a capable navigation
+   pipeline, not to be the sole guidance for a blind user crossing real streets.
+   It has had no real-world safety validation. Do not deploy it with users
+   without supervised testing and the appropriate review — liability, insurance,
+   and possibly regulatory — which is a matter for qualified counsel, not this
+   README.
+
+3. **Fail safe, fail loud.** When perception is uncertain (low `walkable_ratio`,
+   conflicting depth), the downstream system should go quiet and signal
+   uncertainty rather than confidently guide someone.
+
+---
+
+## Project structure
 
 ```
 requirements.txt     # Python deps for the server
@@ -124,6 +146,8 @@ server/
 live_view.py         # desktop client: video → server → overlay
 webapp/              # phone client: both models on-device in the browser
 ```
+
+---
 
 ## Authors
 
