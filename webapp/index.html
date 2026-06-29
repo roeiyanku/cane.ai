@@ -93,9 +93,9 @@ env.allowLocalModels = false;
 
 // ── Config: models, working resolution, fusion constants, overlay colors ───
 // ---- models (swap here if you want a heavier/lighter checkpoint) ----------
-// b1 is the speed/accuracy middle ground for phones: clearly better than b0 at
-// finding the path/road, much faster than b2. (b0 = fastest, b2 = most accurate.)
-const SEG_MODEL   = "Xenova/segformer-b1-finetuned-ade-512-512";
+// b0 is the fastest checkpoint — lowest accuracy at finding the path/road, but
+// the lightest on a phone GPU. (b0 = fastest, b1 = middle, b2 = most accurate.)
+const SEG_MODEL   = "Xenova/segformer-b0-finetuned-ade-512-512";
 const DEPTH_MODEL = "onnx-community/depth-anything-v2-small";
 
 // Working resolution for fusion. Small = fast; the camera is downscaled to

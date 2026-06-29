@@ -4,6 +4,32 @@ Monocular perception for assistive pedestrian navigation. A single camera frame
 goes in; sidewalk segmentation, depth, and fused navigation cues come out. No
 third-party inference API — both models run locally.
 
+---
+
+## ▶ Run the demo (start here)
+
+**The demo is [`webapp/index.html`](webapp/index.html).** It runs the whole
+pipeline live on your phone's browser — no PC server, no install.
+
+> ⚠️ **You CANNOT just double-click `index.html`.** Opening the file directly
+> (`file://`) will **not** get camera access — browsers only allow the camera on
+> a page served over **HTTPS**. You must serve it. Here's the fastest way:
+
+```bash
+cd webapp
+python -m http.server 8080                       # serve the page
+npx cloudflared tunnel --url http://localhost:8080   # get an HTTPS URL (new terminal)
+```
+
+Then **open the printed `https://...trycloudflare.com` URL on your phone** and
+tap **Start camera**. That's it — both models load on-device the first time
+(~200 MB) and the live overlay appears.
+
+Full options (GitHub Pages, tuning, requirements) are in
+[`webapp/README.md`](webapp/README.md).
+
+---
+
 ## What it does
 
 ```
@@ -98,3 +124,7 @@ server/
 live_view.py         # desktop client: video → server → overlay
 webapp/              # phone client: both models on-device in the browser
 ```
+
+## Authors
+
+Created by **Roei Yanku** and **Tzvi Lengerman**.

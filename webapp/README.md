@@ -8,6 +8,13 @@ with no PC and no app install. Both models run in the phone's browser via
 It mirrors `server/perception.py` (fusion) and `live_view.py` (overlay), ported
 to JavaScript.
 
+## ⚠️ You must SERVE `index.html` — do not open the file directly
+
+Double-clicking `index.html` (a `file://...` URL) **will not work** — the camera
+stays black. Browsers only grant camera access on a page served over **HTTPS**
+(a "secure context"). So the demo runs only if you serve the page one of the two
+ways below. There is no third option where you just open the file.
+
 ## Requirements
 
 - **Android Chrome** (recent) with WebGPU. Check `chrome://gpu` shows WebGPU
